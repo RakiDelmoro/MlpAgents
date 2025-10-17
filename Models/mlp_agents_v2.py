@@ -14,7 +14,7 @@ class Agent(nn.Module):
     def forward(self, input_x, previous_activation):
         input_to_net = torch.cat([previous_activation, input_x], dim=1)
         return self.network(input_to_net)
-
+    
 class MultiAgentsV2(nn.Module):
     def __init__(self, input_dim, hidden_dim, num_agents, num_classes=10):
         super().__init__()
@@ -31,7 +31,7 @@ class MultiAgentsV2(nn.Module):
         device = input_image.device
         training_mode = target_label is not None
 
-        target_activation = self.indices_to_feature(target_label) if training_mode else target_label
+        target_activation = self.indices_to_feature(target_label).detach() if training_mode else target_label
         activation = torch.randn(batch_size, self.hidden_dim, device=device)
 
         agents_out = []
@@ -47,31 +47,26 @@ class MultiAgentsV2(nn.Module):
 
             activation = agent_prediction
             agents_out.append(agent_prediction)
-
+        
         logits = self.output_layer(activation.detach())
         if training_mode: logits_loss = functional.cross_entropy(logits, target_label)
         total_loss = logits_loss + agents_errors
 
         return logits, total_loss
-
+    
     def infer_each_agent(self, input_image, target_label):
         batch_size = input_image.shape[0]
         device = input_image.device
 
         activation = torch.randn(batch_size, self.hidden_dim, device=device)
-        agents_outs = []
+        each_agents_accuracy = torch.zeros(self.num_agents)
         for each in range(self.num_agents):
             # Each agent predict label embedding
-            embed_pred = self.agents[each](input_image, activation)
-            activation = embed_pred
-            agents_outs.append(embed_pred)
-
-        each_agents_accuracy = torch.zeros(self.num_agents)
-        for i, out in enumerate(agents_outs):
-            agent_logits = self.output_layer(out)
-            batch_accuracy = (agent_logits.argmax(axis=-1) == target_label).float().mean()
-
-            each_agents_accuracy[i] += batch_accuracy.item()
+            activation = self.agents[each](input_image, activation)
+            agent_logits = self.output_layer(activation)
+            
+            accuracy = (agent_logits.argmax(axis=-1) == target_label).float().mean()
+            each_agents_accuracy[each] += accuracy.item()
 
         return each_agents_accuracy
 
