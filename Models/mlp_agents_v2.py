@@ -14,7 +14,7 @@ class Agent(nn.Module):
 
     def forward(self, input_x, answer_y, latent_z):
         return self.deep_recursion(input_x, answer_y, latent_z)
-    
+
     def latent_recursion(self, input_x, answer_y, latent_z, n=6):
         input_to_net = torch.cat([latent_z, input_x], dim=1)
         for _ in range(n):
@@ -38,53 +38,53 @@ class MultiAgentsV2(nn.Module):
         self.num_agents = num_agents
         self.hidden_dim = hidden_dim
 
-        self.indices_to_feature = nn.Embedding(num_embeddings=num_classes, embedding_dim=hidden_dim)
+        self.indices_to_feature = [torch.randn(num_classes, hidden_dim, device='cuda') for _ in range(num_agents)]
         self.agents = nn.ModuleList([Agent(input_dim, hidden_dim) for _ in range(num_agents)])
-        self.output_layers = nn.ModuleList([nn.Linear(hidden_dim, num_classes) for _ in range(num_agents)])
+        self.agent_decoders = nn.ModuleList([nn.Linear(hidden_dim, num_classes) for _ in range(num_agents)])
 
     def forward(self, input_image, target_label=None):
         batch_size = input_image.shape[0]
         device = input_image.device
         training_mode = target_label is not None
-
-        target_activation = self.indices_to_feature(target_label).detach() if training_mode else target_label
+    
         answer_y = torch.zeros(batch_size, self.hidden_dim, device=device) # Answer
         latent_z = torch.zeros(batch_size, self.hidden_dim, device=device) # Agent latent reasoning
 
-        logits_loss = 0.0
         agents_errors = 0.0
         for each in range(self.num_agents):
             # Each agent predict target activation
             agent_prediction, agent_latent_z = self.agents[each](input_image, answer_y, latent_z)
-            agent_logits = self.output_layers[each](agent_prediction.detach())
-
+            one_hot_encoded = self.decode_agent_prediction(agent_prediction, self.indices_to_feature[each])
             if training_mode:
-                agent_pred_error = functional.mse_loss(agent_prediction, target_activation)
-                agent_logits_error = functional.cross_entropy(agent_logits, target_label)
+                agent_target_activation =  self.indices_to_feature[each][target_label]
+                agent_pred_error = functional.mse_loss(agent_prediction, agent_target_activation)
 
-                logits_loss += agent_logits_error
                 agents_errors += agent_pred_error
 
             latent_z = agent_latent_z.detach()
 
-        total_loss = logits_loss + agents_errors
+        total_loss = agents_errors
 
-        return agent_logits, total_loss
+        return one_hot_encoded, total_loss
+
+    def decode_agent_prediction(self, activation, feature):
+        distances = torch.cdist(activation, feature)
+        probabilities = 1 - distances.softmax(dim=-1)
+        return probabilities
 
     def infer_each_agent(self, input_image, target_label):
         device = input_image.device
 
-        target_activation = self.indices_to_feature(target_label)
+        target_activation = torch.zeros(input_image.shape[0], self.hidden_dim, device=device)
         activation = torch.zeros_like(target_activation, device=device)
         latent_z = torch.zeros_like(target_activation, device=device)
 
         each_agents_accuracy = torch.zeros(self.num_agents)
         for each in range(self.num_agents):
-            # Each agent predict label embedding
             agent_prediction, latent_z = self.agents[each](input_image, activation, latent_z)
-            agent_logits = self.output_layers[each](agent_prediction)
+            one_hot_encoded = self.decode_agent_prediction(agent_prediction, self.indices_to_feature[each])
             
-            accuracy = (agent_logits.argmax(axis=-1) == target_label).float().mean()
+            accuracy = (one_hot_encoded.argmax(axis=-1) == target_label).float().mean()
             each_agents_accuracy[each] += accuracy.item()
 
         return each_agents_accuracy
@@ -94,16 +94,18 @@ class MultiAgentsV2(nn.Module):
 
         activation = torch.zeros(input_image.shape[0], self.hidden_dim, device=device)
         latent_z = torch.zeros(input_image.shape[0], self.hidden_dim, device=device)
-
+    
         each_agents_prediction = torch.zeros(self.num_agents)
+        agents_one_hot_encoded = []
         for each in range(self.num_agents):
             agent_prediction, latent_z = self.agents[each](input_image, activation, latent_z)
-            agent_logits = self.output_layers[each](agent_prediction)
-            digit_prediction = agent_logits.argmax(axis=-1)
+            one_hot_encoded = self.decode_agent_prediction(agent_prediction, self.indices_to_feature[each])
+            digit_prediction = one_hot_encoded.argmax(axis=-1)
 
             each_agents_prediction[each] += digit_prediction.item()
+            agents_one_hot_encoded.append(one_hot_encoded)
 
-        return each_agents_prediction.type(torch.int64).tolist()
+        return each_agents_prediction.type(torch.int64).tolist(), agents_one_hot_encoded
 
 # model = MultiAgentsV2(input_dim=784, hidden_dim=256, num_agents=8, num_classes=10)
 # print(sum(param.numel() for param in model.parameters()))
