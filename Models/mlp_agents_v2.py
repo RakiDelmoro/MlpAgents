@@ -10,15 +10,28 @@ class Agent(nn.Module):
         self.input_size = input_size
         self.hidden_size = hidden_size
 
-        self.mlp_layers = nn.Sequential(
-            nn.Linear(input_size + hidden_size, hidden_size * 2),
+        self.mlp_for_image = nn.Sequential(
+            nn.Linear(input_size, hidden_size*2),
             nn.ReLU(),
-            nn.Linear(hidden_size * 2, hidden_size * 2),
-            nn.ReLU(),
-            nn.Linear(hidden_size * 2, hidden_size))
+            nn.Linear(hidden_size*2, hidden_size),
+            nn.ReLU())
 
-    def forward(self, input_x):
-        return self.mlp_layers(input_x)
+        self.mlp_for_embed = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size*2),
+            nn.ReLU(),
+            nn.Linear(hidden_size*2, hidden_size),
+            nn.ReLU())
+
+        self.mlp_combined = nn.Sequential(
+            nn.Linear(hidden_size + hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size))
+
+    def forward(self, input_img, embeddding):
+        mlp_img_out = self.mlp_for_image(input_img)
+        mlp_embed_out = self.mlp_for_embed(embeddding)
+        combined = torch.cat([mlp_img_out, mlp_embed_out], dim=-1)
+        return self.mlp_combined(combined)
 
 class MultiAgentsV2(nn.Module):
     def __init__(self, input_dim, hidden_dim, num_agents, num_classes=10):
@@ -32,11 +45,9 @@ class MultiAgentsV2(nn.Module):
         self.optimizer = torch.optim.Adam(self.parameters(), lr=0.001)
 
     def latent_recursion(self, agent, input_x, answer_y, latent_z, n=6):
-        input_to_net = torch.cat([latent_z, input_x], dim=-1)
         for _ in range(n):
-            latent_z = agent(input_to_net)
-        input_to_net = torch.cat([latent_z, input_x], dim=-1)
-        answer_y = agent(input_to_net)
+            latent_z = agent(input_x, latent_z)
+        answer_y = agent(input_x, latent_z)
         return answer_y, latent_z
 
     def deep_recursion(self, agent, input_emb, answer_y, latent_z, n=6, t=3):
@@ -44,20 +55,25 @@ class MultiAgentsV2(nn.Module):
             for _ in range(t-1):
                 answer_y, latent_z = self.latent_recursion(agent, input_emb, answer_y, latent_z)
         # recursing once to improve answer_y and latent_z
-        answer_y, latent_z = self.latent_recursion(agent, input_emb, answer_y, latent_z, n)
-        return answer_y, latent_z
+        answer_y, latent_z = self.latent_recursion(agent, input_emb, answer_y, latent_z)
+        return answer_y, latent_z.detach()
     
+    def supervision(self, agent, input_emb, answer_y, latent_z):
+        for _ in range(16):
+            answer_y, latent_z = self.deep_recursion(agent, input_emb, answer_y, latent_z)
+        return answer_y, latent_z
+
     def forward(self, input_image, target_label=None):
         batch_size = input_image.shape[0]
         device = input_image.device
         training_mode = target_label is not None
-    
+
         answer_y = torch.zeros(batch_size, self.hidden_dim, device=device) # Answer
         latent_z = torch.zeros(batch_size, self.hidden_dim, device=device) # Agent latent reasoning
 
         agents_errors = 0.0
         for each in range(self.num_agents):
-            agent_prediction, agent_latent_z = self.deep_recursion(self.agents[each], input_image, answer_y, latent_z)
+            agent_prediction, agent_latent_z = self.supervision(self.agents[each], input_image, answer_y, latent_z)
             one_hot_encoded = self.decode_agent_prediction(agent_prediction, self.indices_to_feature[each])
             if training_mode:
                 agent_target_activation =  self.indices_to_feature[each][target_label]
@@ -68,8 +84,6 @@ class MultiAgentsV2(nn.Module):
                 self.optimizer.zero_grad()
                 agent_pred_error.backward()
                 self.optimizer.step()
-
-            latent_z = agent_latent_z.detach()
 
         total_loss = agents_errors
 
@@ -89,9 +103,9 @@ class MultiAgentsV2(nn.Module):
 
         each_agents_accuracy = torch.zeros(self.num_agents)
         for each in range(self.num_agents):
-            agent_prediction, latent_z = self.deep_recursion(self.agents[each], input_image, activation, latent_z)
+            agent_prediction, agent_latent_z = self.supervision(self.agents[each], input_image, activation, latent_z)
             one_hot_encoded = self.decode_agent_prediction(agent_prediction, self.indices_to_feature[each])
-            
+
             accuracy = (one_hot_encoded.argmax(axis=-1) == target_label).float().mean()
             each_agents_accuracy[each] += accuracy.item()
 
@@ -107,10 +121,9 @@ class MultiAgentsV2(nn.Module):
         each_agents_prediction = torch.zeros(self.num_agents)
         agents_one_hot_encoded = []
         for each in range(self.num_agents):
-            agent_prediction, latent_z = self.deep_recursion(self.agents[each], input_image, activation, latent_z)
+            agent_prediction, agent_latent_z = self.supervision(self.agents[each], input_image, activation, latent_z)
             one_hot_encoded = self.decode_agent_prediction(agent_prediction, self.indices_to_feature[each])
             digit_prediction = one_hot_encoded.argmax(axis=-1)
-
             each_agents_prediction[each] += digit_prediction.item()
             agents_one_hot_encoded.append(one_hot_encoded)
 
