@@ -1,216 +1,223 @@
 import torch
+import numpy as np
+import torch.nn as nn
+from collections import Counter
+
+import torch
 import torch.nn as nn
 import numpy as np
 
-class DigitMemory:
-    def __init__(self, num_neurons, device='cuda'):
-        self.num_neurons = num_neurons
-        self.device = device
-        self.memory = torch.zeros(num_neurons, dtype=torch.bool, device=device)
-        self.num_vectors = 0
-
-    def add(self, feature):
-        """Add a new feature to the memory"""
-        self.memory = torch.logical_or(self.memory, feature)
-        self.num_vectors += 1
-
-    def reset(self):
-        """Clear the union for a new training epoch"""
-        self.memory = torch.zeros(self.num_neurons, dtype=torch.bool, device=self.device)
-        self.num_vectors = 0
-
-    def match_score(self, new_feature):
-        """Calculate overlap score between memory and new feature"""
-        overlap = torch.logical_and(new_feature, self.memory).sum().float()
-        new_feature_active = new_feature.sum().float()
-        memory_active = self.memory.sum().float()
-        
-        if new_feature_active == 0:
-            return torch.tensor(0.0, device=self.device)
-        memory_size = (new_feature_active + memory_active - overlap)
-        return overlap / memory_size
-    
-    def get_active_neurons(self):
-        """Return number of ON bits in union"""
-        return self.memory.sum().item()
-
 class Agent(nn.Module):
-    def __init__(self, input_size: int, num_neurons: int, sparsity: float = 0.02,
-                 synapse_threshold: float = 0.5, boost_strength: float = 1.0, potential_connection=0.2, num_classes=10):
+    def __init__(self, input_size: int, num_neurons: int, local_neuron_act_sparsity: float = 0.05,
+                 synapse_threshold: float = 0.5, boost_strength: float = 0.1):
         super().__init__()
         self.input_size = input_size
-        self.num_agents = num_neurons
-        self.sparsity = sparsity
+        self.num_neurons = num_neurons
+        self.sparsity = local_neuron_act_sparsity
         self.synapse_threshold = synapse_threshold
         self.boost_strength = boost_strength
-        
-        self.receptive_field_radius = 8
-        self.class_unions = [DigitMemory(num_neurons) for _ in range(num_classes)]
-        self.potential_connection_mask = self._build_receptive_field_connection(potential_connection)
 
-        # Permanent synaptic connections (0-1)
-        self.permanences = nn.Parameter((torch.rand(num_neurons, input_size, device='cuda') * 0.4 + 0.3) * self.potential_connection_mask.float(), requires_grad=False)
-        
-        # Boosting factors for homeostatic regulation
-        self.register_buffer('boost_factors', torch.ones(num_neurons, device='cuda'))
+        self.receptive_field_size = 3
+        self.input_h, self.input_w = 28, 28
+        self.col_h, self.col_w = 32, 32
+
+        # Build and store receptive field mask
+        self.register_buffer('receptive_field_mask', self._build_receptive_field_connection())
+
+        # Permanent synaptic connections (0-1), initialized with receptive field
+        permanences_init = torch.rand(num_neurons, input_size, device='cuda') * 0.4 + 0.3
+        permanences_init = permanences_init * self.receptive_field_mask
+        self.permanences = nn.Parameter(permanences_init, requires_grad=False)
+
+        # Boost factors for inactive neurons
+        self.register_buffer('boost', torch.ones(num_neurons, device='cuda'))
+        # Duty cycles
         self.register_buffer('active_duty_cycle', torch.zeros(num_neurons, device='cuda'))
+        self.register_buffer('overlap_duty_cycle', torch.zeros(num_neurons, device='cuda'))
 
-    def binary_input(self, x):
-        return (x > 0.5).float()
+    def encode_input(self, x):
+        """Convert input to binary using threshold."""
+        return (x > 0.4).float()
 
-    def compute_overlap(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute overlap scores between input and neuron synapses."""
+    def local_inhibition(self, neurons_activation, inhibition_radius=3):
+        """Apply local inhibition using unfold for efficiency."""
+        batch_size = neurons_activation.shape[0]
+        activation_as_2d = neurons_activation.view(batch_size, self.col_h, self.col_w)
+        
+        kernel_size = 2 * inhibition_radius + 1
+        spatial_size = kernel_size * kernel_size
+        target_neuron_num =  max(1, int(spatial_size * self.sparsity))
+
+        # Unfold to get neighborhood patches efficiently
+        pad = inhibition_radius
+        padded = torch.nn.functional.pad(activation_as_2d, (pad, pad, pad, pad), mode='constant', value=-1e9)
+        unfolded = torch.nn.functional.unfold(padded.unsqueeze(1), kernel_size=(kernel_size, kernel_size), padding=0)  # Shape: (batch_size, kernel_size^2, col_h*col_w)
+        
+        # Get top neuron activation values and their positions in each neighborhood
+        topk_values, topk_indices = torch.topk(unfolded, k=min(target_neuron_num, kernel_size * kernel_size), dim=1, largest=True)        
+        # Get the k-th largest value (threshold) for each position
+        kth_value = topk_values[:, -1, :]  # (batch_size, col_h*col_w)
+        kth_value_2d = kth_value.view(batch_size, self.col_h, self.col_w)
+
+        # Neuron wins if its num connected >= k-th largest in its neighborhood and num connected > 0
+        active_neurons_2d = (activation_as_2d >= kth_value_2d) & (activation_as_2d > 0)
+        neurons_activation = active_neurons_2d.view(batch_size, -1).float()
+        
+        return neurons_activation
+
+    def compute_num_connected(self, input_activation):
+        """Compute connected scores between input and neuron synapses."""
+        # Create binary connectivity from permanences
         connected = (self.permanences > self.synapse_threshold).float()
-        num_connected = connected.sum(dim=1, keepdim=True).clamp_min(1.0)
-        overlap = torch.matmul(x, connected.t()) / num_connected.t()
-        return overlap * self.boost_factors.unsqueeze(0)
+        # Overlap = number of connected synapses that are active
+        overlap = torch.matmul(input_activation, connected.t())
+        return overlap
+
+    def _build_receptive_field_connection(self):
+        """
+        Create a mask defining which input bits can connect to each column
+        based on receptive field topology.
+        """
+        column_size = self.col_h * self.col_w
+        input_size = self.input_h * self.input_w
+        
+        # Calculate receptive field center offset
+        rf_offset = self.receptive_field_size // 2
+        
+        # Scale factors from input to column space
+        scale_h = self.input_h / self.col_h
+        scale_w = self.input_w / self.col_w
+        
+        connection = torch.zeros(column_size, input_size, device='cuda')
+        
+        for col_idx in range(column_size):
+            col_row = col_idx // self.col_w
+            col_col = col_idx % self.col_w
+            
+            # Calculate receptive field center in input space
+            center_h = int((col_row + 0.5) * scale_h)
+            center_w = int((col_col + 0.5) * scale_w)
+            
+            # Define receptive field bounds
+            h_min = max(0, center_h - rf_offset)
+            h_max = min(self.input_h, center_h + rf_offset + 1)
+            w_min = max(0, center_w - rf_offset)
+            w_max = min(self.input_w, center_w + rf_offset + 1)
+            
+            # Set mask for this column's receptive field
+            for h in range(h_min, h_max):
+                for w in range(w_min, w_max):
+                    input_idx = h * self.input_w + w
+                    connection[col_idx, input_idx] = 1.0
+        
+        return connection
+    
+    def _update_duty_cycles(self, active, neurons_activation):
+        """Update duty cycles based on raw overlap (before boosting)."""
+        decay = 0.999
+        
+        # Average across batch
+        active_mean = active.mean(dim=0)
+        overlap_mean = (neurons_activation > 0).float().mean(dim=0)
+        
+        # Exponential moving average
+        self.active_duty_cycle.mul_(decay).add_(active_mean, alpha=1 - decay)
+        self.overlap_duty_cycle.mul_(decay).add_(overlap_mean, alpha=1 - decay)
+
+    def _update_boost(self):
+        """Update boost factors based on duty cycles."""
+        target_duty_cycle = self.sparsity
+        min_duty_cycle = 0.001
+        
+        # Clamp duty cycles to avoid division by zero
+        overlap_dc = torch.clamp(self.overlap_duty_cycle, min=min_duty_cycle)
+        active_dc = torch.clamp(self.active_duty_cycle, min=min_duty_cycle)
+        
+        # Boost = target / actual, scaled by boost_strength
+        boost = target_duty_cycle / active_dc
+        self.boost = torch.clamp(boost * self.boost_strength, min=1.0, max=10.0)
+
+    def _learn(self, x: torch.Tensor, active_neurons: torch.Tensor):
+        """Update permanences using Hebbian learning."""
+        permanences_inc = 0.02
+        permanences_dec = 0.002
+
+        neurons_active_indices = torch.where(active_neurons > 0)[1]
+        # Strengthen synapses that fired
+        self.permanences.data[neurons_active_indices] += x.mean(dim=0) * permanences_inc
+        # Weaken synapses that didn't fire
+        inactive_inputs = 1 - x
+        self.permanences.data[neurons_active_indices] -= inactive_inputs.mean(dim=0) * permanences_dec
+        
+        # Clamp permanences to valid range and apply receptive field mask
+        self.permanences.data = torch.clamp(self.permanences.data, 0, 1)
+        self.permanences.data = self.permanences.data * self.receptive_field_mask
 
     def forward(self, x: torch.Tensor, learn: bool = True):
-        normalized_x = self.binary_input(x)
-        overlap = self.compute_overlap(normalized_x)
-
-        # Winner-take-all with sparsity constraint
-        k = max(1, int(self.num_agents * self.sparsity))
-        topk_values, top_neuron_indices = torch.topk(overlap, k, dim=-1)
-
-        active_neurons = torch.zeros_like(overlap, device='cuda')
-        active_neurons.scatter_(1, top_neuron_indices, 1.0)
-
+        """Forward pass with spatial pooling."""
+        input_binary = self.encode_input(x)
+        
+        # Compute raw overlap (before boosting)
+        neurons_num_connected = self.compute_num_connected(input_binary)
+        
+        # Apply boost to overlap
+        boosted_neurons_num_connected = neurons_num_connected * self.boost.unsqueeze(0)
+        
+        # Get active neurons via local inhibition
+        neurons_activation = self.local_inhibition(boosted_neurons_num_connected, inhibition_radius=3)
+        active_neurons_indices = torch.where(neurons_activation > 0)[1]
+        
         if learn:
-            self._learn(x, active_neurons)
-
-        return active_neurons, top_neuron_indices
-    
-    def _build_receptive_field_connection(self, potential_connection):
-        H, W = 28, 28
-        patch_h, patch_w = 16, 16
-        mask = torch.zeros(self.num_agents, self.input_size, device='cuda')
-
-        for ci in range(patch_h):
-            for cj in range(patch_w):
-                col_idx = ci * patch_w + cj
-
-                # Map column center to input coordinates
-                center_y = int((ci + 0.5) * H / H)
-                center_x = int((cj + 0.5) * W / W)
-
-                # Define receptive field window
-                for yi in range(max(0, center_y - self.receptive_field_radius),
-                                min(H, center_y + self.receptive_field_radius)):
-                    for xi in range(max(0, center_x - self.receptive_field_radius),
-                                    min(W, center_x + self.receptive_field_radius)):
-                        if torch.rand(1).item() < potential_connection:
-                            mask[col_idx, yi * W + xi] = 1.0
-        return mask
-
-    def _learn(self, x: torch.Tensor, agents: torch.Tensor):
-        """Update permanences using Hebbian learning."""
-        self.active_duty_cycle *= 0.999
-        self.active_duty_cycle += 0.001 * agents.mean(dim=0)
-
-        for i in range(x.shape[0]):
-            active_agents = agents[i].nonzero(as_tuple=True)[0]
-            if len(active_agents) > 0:
-                self.permanences[active_agents] += 0.05 * x[i].unsqueeze(0)
-                self.permanences[active_agents] -= 0.008 * (1 - x[i].unsqueeze(0))
-
-        self.permanences.data.clamp_(0, 1)
+            self._update_duty_cycles(neurons_activation, neurons_num_connected)
+            self._update_boost()
+            self._learn(input_binary, neurons_activation)
         
-        target_density = self.sparsity
-        self.boost_factors = torch.exp(
-            self.boost_strength * (target_density - self.active_duty_cycle))
+        return neurons_activation, active_neurons_indices
 
-    def reset_memory(self):
-        for union in self.class_unions:
-            union.reset()
-        
-    def add_to_memory(self, feature, label):
-        self.class_unions[label].add(feature)
+    def predict(self, new_activation, model_memories):
+        new_activation = new_activation.flatten().tolist()
+        scores = []
+        for memory in model_memories:
+            score = len(set(new_activation) & set(memory['neurons_activation'])) / len(new_activation)
+            scores.append((score, memory['label']))
 
-    def predict(self, feature):
-        scores = torch.tensor([
-            union.match_score(feature).item() 
-            for union in self.class_unions], device='cuda')
+        top_scores = sorted(scores, reverse=True)[:5]
+        top_scores_labels = [label for _, label in top_scores]
 
-        predicted_label = torch.argmax(scores).item()
-        return predicted_label, scores
-    
-    def check_stability(self, test_loader, previous_features, num_samples=1000):
-        current_features = []
-        with torch.no_grad():
-            for image, _ in test_loader:
-                batched_image = torch.tensor(image, requires_grad=True, device='cuda')
-                features, _ = self.forward(batched_image, learn=False)
-                for i in range(batched_image.shape[0]):
-                    current_features.append(features[i].clone())
+        votes = Counter(top_scores_labels)
+        return votes.most_common(1)[0][0]
 
-                if len(current_features) >= num_samples:
-                    break
-
-        current_features = current_features[:num_samples]
-        print("Mean sparsity:", torch.stack(current_features).mean().item())
-
-        if previous_features is None:
-            return None, current_features
-
-        stabilities = []
-        for currrent, previous in zip(current_features, previous_features):
-            overlap = (currrent * previous).sum()
-            total = currrent.sum()
-            if total > 0:
-                stabilities.append((overlap / total).item())
-        stability = sum(stabilities) / len(stabilities) if stabilities else 0.0
-
-        return stability, current_features
-
-    def phase_1(self, train_loader, test_loader, epoch, previous_features):
+    def phase_1(self, train_loader):
         '''Phase 1 is equavalent to learning. interacting to the task we want to learn'''
+        print('Learning...')
+        for image, _ in train_loader:
+            image = torch.tensor(image, device='cuda')
+            _, _ = self.forward(image, learn=True)
+        print('Done learning!')
 
-        for batch_idx, (image, label) in enumerate(train_loader):
-            batched_image = torch.tensor(image, requires_grad=True, device='cuda')
-            _, _ = self.forward(batched_image, learn=True)
+    def phase_2(self, memory_loader):
+        '''Phase 2 is equavalent to memory. assigning label to the learned sparse neurons activation after phase 1'''
+        model_memory = []
+        print('Adding memory....')
+        for image, label in memory_loader:
+            image = torch.tensor(image, device='cuda')
 
-        stability, current_features = self.check_stability(test_loader, previous_features=previous_features)
-        if stability is None:
-            print(f"Epoch {epoch} - First epoch, baseline set")
-        else:
-            print(f"Epoch {epoch} - Features Overlap with prev epoch: {stability:.3f}")
-            print(f"  (1.0 = no change, <0.9 = still learning)")
-        
-        # Check if learning has plateaued
-        if stability is not None and stability > 0.95:
-            print(f"Representations stabilized! Stopping early at epoch {epoch}")
-        
-        return current_features
+            _, active_neurons_indices = self.forward(image, learn=False)
+            model_memory.append({'neurons_activation': active_neurons_indices.flatten().tolist(),
+                                 'label': str(label.item())})
+        print('Done!')
 
-    def phase_2(self, train_loader, test_loader):
-        '''Phase 2 is equavalent to memory. assigning label to the features after phase 1'''
+        return model_memory
 
-        with torch.no_grad():
-            print('Creating memory...')
-            for image, label in train_loader:
-                batched_image = torch.tensor(image, requires_grad=True, device='cuda')
-                batched_label = torch.tensor(label, device='cuda')
+    def test(self, model_memory, test_loader):
+        correctness = []
+        for image, label in test_loader:
+            batched_image = torch.tensor(image, device='cuda')
 
-                features, _ = self.forward(batched_image, learn=False)
-                self.add_to_memory(features, batched_label)
-            print('Done creating memory')
+            _, active_neurons_indices = self.forward(batched_image, learn=False)
+            predicted = self.predict(active_neurons_indices, model_memory)
 
-            correctness = []
-            for image, label in test_loader:
-                batched_image = torch.tensor(image, device='cuda')
-                batched_label = torch.tensor(label, device='cuda')
+            correct = int(int(predicted) == label.item())
+            correctness.append(correct)
 
-                features, _ = self.forward(batched_image, learn=False)
-                predicted, scores = self.predict(features)
-
-                correct = int(predicted == batched_label.item())
-                correctness.append(correct)
-
-            print(f'Accuracy: {sum(correctness) / len(correctness)}')
-
-        torch.save(self.forward, 'thousand_agents.pth')
-
-# input_x = torch.rand(1, 784, device='cuda')
-# model = SpatialPooler(input_size=784, num_agents=2048, sparsity=0.02)
-# print(model(input_x).shape)
+        return sum(correctness) / len(correctness)
