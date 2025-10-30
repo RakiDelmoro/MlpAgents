@@ -3,7 +3,6 @@ import pickle
 import torch
 import numpy as np
 from Models.brain import Agent
-from Models.brain_v2 import TopologicalSpatialPooler, SDRUnionClassifier
 
 def mnist_dataloader(img_arr, label_arr, batch_size, shuffle):
     num_samples = img_arr.shape[0]    
@@ -28,23 +27,21 @@ def training_runner():
     assert test_images.shape[0] == test_labels.shape[0]
     assert train_images.shape[1] == test_images.shape[1] == IMAGE_HEIGHT*IMAGE_WIDTH
 
-    model = Agent(input_size=784, num_neurons=1024)
-    for epoch in range(100):
+    model = Agent(input_size=(28,28), receptive_field_size=(28, 4), num_neurons=1024)
+    for epoch in range(1, 101):
         train_loader = mnist_dataloader(train_images, train_labels, batch_size=1, shuffle=True)
-        test_loader = mnist_dataloader(test_images[:1000], test_labels, batch_size=1, shuffle=True)
-
         # LEARNING...
         model.phase_1(train_loader)
-
-        # Test model every 5 epochs
-        if (epoch + 1) % 5  == 0:
+        # Test model every 1 epochs
+        if epoch % 1  == 0:
             memory_loader = mnist_dataloader(train_images, train_labels, batch_size=1, shuffle=True)
-            model_memories = model.phase_2(memory_loader)
-            accuracy = model.test(model_memories, test_loader)
+            test_loader = mnist_dataloader(test_images, test_labels, batch_size=1, shuffle=True)
 
-            print(f'EPOCH: {epoch+1} Accuracy: {accuracy}')
+            model_memories = model.phase_2(memory_loader)
+            accuracy, scores = model.test(model_memories, test_loader)
+            print(f'EPOCH: {epoch} Accuracy: {accuracy} Average score: {scores}')
         else:
-            print(f'EPOCH: {epoch+1} not testing yet...')
+            print(f'EPOCH: {epoch} not testing yet...')
 
     torch.save(model, 'RockV1.pth')
 
