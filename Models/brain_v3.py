@@ -181,14 +181,19 @@ class CorticalColumn(nn.Module):
         category_scores = torch.matmul(basal_activation, self.decoder_synapse)
 
         for _ in range(2):
-            predicted_category = torch.argmax(category_scores).unsqueeze(0)
-            apical_features = self.apical_encoder.encode(predicted_category)
+            topk_scores, top_indices = torch.topk(category_scores, k=3)
+            confidence = torch.softmax(topk_scores, dim=-1).squeeze(0)
+
+            apical_features = sum(c * self.apical_encoder.encode(idx) for c, idx in zip(confidence, top_indices.squeeze(0))).unsqueeze(0)
 
             modulated_activation_raw = self.compute_neuron_activation(basal_features, apical_features, modulation_strength=0.7)
-            modulated_activation = self.get_neurons_firing(modulated_activation_raw)
-            category_scores = torch.matmul(modulated_activation, self.decoder_synapse)
+            basal_activation_raw = 0.7 * basal_activation_raw + 0.3 * modulated_activation_raw
+            basal_activation = self.get_neurons_firing(basal_activation_raw)
 
-        predicted_label = torch.argmax(category_scores).item()
+            category_scores = torch.matmul(basal_activation, self.decoder_synapse)
+
+        category_probs = torch.softmax(category_scores, dim=-1)
+        predicted_label = torch.argmax(category_probs).item()
         return predicted_label
     
     def runner(self, train_loader, test_loader):
