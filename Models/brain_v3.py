@@ -101,12 +101,13 @@ class CorticalColumn(nn.Module):
         # Synaptic connections
         self.basal_synapse = nn.Parameter(torch.rand(basal_size, neurons_size, device='cuda') * 0.4 + 0.3, requires_grad=False)
         self.apical_synapse = nn.Parameter(torch.rand(apical_size, neurons_size, device='cuda') * 0.4 + 0.3,requires_grad=False)
+        self.decoder_synapse =  nn.Parameter(torch.rand(neurons_size, num_classes, device='cuda') * 0.4 + 0.3,requires_grad=False)
 
         self.num_active_neurons = int(round(neurons_size * sparsity))
 
     def get_total_params(self):
         return self.basal_synapse.flatten().shape[0] + self.apical_synapse.flatten().shape[0]
-    
+
     def get_neurons_firing(self, neurons_activation):
         top_indices = torch.topk(neurons_activation, self.num_active_neurons, dim=-1)[1]
         neurons_firing = torch.zeros_like(neurons_activation)
@@ -140,28 +141,54 @@ class CorticalColumn(nn.Module):
             self.apical_synapse.data += 0.01 * ((hebbian_term * cooperative_gate) - oja_decay)
             self.apical_synapse.data.clamp_(0.0, 1.0)
 
+    def decoder_update(self, neurons_activation, label):
+        target = torch.zeros(self.num_classes, device='cuda')
+        target[label] = 1.0
+
+        # Hebbian learning: strengthen connections from active neurons to correct label
+        hebbian = torch.outer(neurons_activation.flatten(), target)
+        decay = self.decoder_synapse * (neurons_activation.T ** 2)
+        
+        self.decoder_synapse.data += 0.01 * (hebbian - decay)
+        self.decoder_synapse.data.clamp_(0.0, 1.0)
+
+    def compute_neuron_activation(self, basal_features, apical_features=None, modulation_strength=0.5):
+        basal_drive = torch.matmul(basal_features, self.basal_synapse)
+        
+        if apical_features is None: return basal_drive
+
+        apical_drive = torch.matmul(apical_features, self.apical_synapse)
+        apical_gate = torch.sigmoid(apical_drive - 0.5)
+        modulated_activation = basal_drive * (1 - modulation_strength + modulation_strength * apical_gate)
+
+        return modulated_activation
+
     def training_phase(self, image, label):
         basal_features = self.basal_encoder.encode(image)
         apical_features = self.apical_encoder.encode(label)
 
-        neurons_activation = self.get_neurons_firing(torch.matmul(basal_features, self.basal_synapse))
+        neurons_activation_raw = self.compute_neuron_activation(basal_features, apical_features)
+        neurons_activation = self.get_neurons_firing(neurons_activation_raw)
 
         self.basal_update(basal_features, neurons_activation)
         self.apical_update(apical_features, neurons_activation)
+        self.decoder_update(neurons_activation, label)
 
     def inference_phase(self, image):
         basal_features = self.basal_encoder.encode(image)
-        basal_activation = self.get_neurons_firing(torch.matmul(basal_features, self.basal_synapse))
-        similarities = []
-        for digit in range(self.num_classes):
-            apical_features = self.apical_encoder.encode(digit).unsqueeze(0)
-            apical_activation = self.get_neurons_firing(torch.matmul(apical_features, self.apical_synapse))
-            similarity = torch.nn.functional.cosine_similarity(basal_activation, apical_activation, dim=-1)
-            similarities.append(similarity)
-        
-        similarities = torch.stack(similarities)
-        predicted_label = torch.argmax(similarities).item()
+        basal_activation_raw = self.compute_neuron_activation(basal_features)
+        basal_activation = self.get_neurons_firing(basal_activation_raw)
+        category_scores = torch.matmul(basal_activation, self.decoder_synapse)
 
+        for _ in range(2):
+            predicted_category = torch.argmax(category_scores).unsqueeze(0)
+            apical_features = self.apical_encoder.encode(predicted_category)
+
+            modulated_activation_raw = self.compute_neuron_activation(basal_features, apical_features, modulation_strength=0.7)
+            modulated_activation = self.get_neurons_firing(modulated_activation_raw)
+            category_scores = torch.matmul(modulated_activation, self.decoder_synapse)
+
+        predicted_label = torch.argmax(category_scores).item()
         return predicted_label
     
     def runner(self, train_loader, test_loader):
